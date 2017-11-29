@@ -610,17 +610,19 @@ recv_sys_debug_free(void)
 @param[in]	group		redo log files
 @param[in]	start_lsn	read area start
 @param[in]	end_lsn		read area end
+@param[out] invalid_block - invalid, (maybe incompletely written) block encountered
 @return	valid end_lsn */
-lsn_t
-log_group_read_log_seg(
+static lsn_t
+log_group_read_log_seg_low(
 	byte*			buf,
 	const log_group_t*	group,
 	lsn_t			start_lsn,
-	lsn_t			end_lsn)
+	lsn_t			end_lsn,
+	bool *invalid_block)
 {
 	ulint	len;
 	lsn_t	source_offset;
-
+	*invalid_block = false;
 	ut_ad(log_mutex_own());
 	ut_ad(!(start_lsn % OS_FILE_LOG_BLOCK_SIZE));
 	ut_ad(!(end_lsn % OS_FILE_LOG_BLOCK_SIZE));
@@ -668,6 +670,7 @@ loop:
 			happen when InnoDB was killed while it was
 			writing redo log. We simply treat this as an
 			abrupt end of the redo log. */
+			*invalid_block= true;
 			end_lsn = start_lsn;
 			break;
 		}
@@ -684,6 +687,7 @@ loop:
 					    << " expected: " << crc
 					    << " found: " << cksum;
 				end_lsn = start_lsn;
+				*invalid_block = true;
 				break;
 			}
 
@@ -705,6 +709,49 @@ loop:
 	}
 
 	return(start_lsn);
+}
+
+
+/** Read a log segment to a buffer.
+
+When called inside backup, retries several times,
+if invalid block is encountered (it can be partially written
+by server at the same time)
+
+@param[out]	buf		buffer
+@param[in]	group		redo log files
+@param[in]	start_lsn	read area start
+@param[in]	end_lsn		read area end
+@return	valid end_lsn */
+lsn_t
+log_group_read_log_seg(
+	byte*			buf,
+	const log_group_t*	group,
+	lsn_t			start_lsn,
+	lsn_t			end_lsn)
+{
+	bool invalid_block;
+
+	if (srv_operation != SRV_OPERATION_BACKUP) {
+		return log_group_read_log_seg_low(buf, group, start_lsn,
+				end_lsn, &invalid_block);
+	}
+
+	/* During backup, the server is writing log blocks in parallel
+	and backup can read a partially written block, with mismatched checksum.
+	We need to sleep and retry reads if this happens. */
+
+	for(int retries = 100; ; retries--){
+		start_lsn = log_group_read_log_seg_low(buf, group, start_lsn,
+			end_lsn, &invalid_block);
+
+		if (!invalid_block || retries == 0) {
+			return start_lsn;
+		}
+
+		ib::warn() << "Retrying read of a redo log block";
+		my_sleep(10000);
+	}
 }
 
 /********************************************************//**
